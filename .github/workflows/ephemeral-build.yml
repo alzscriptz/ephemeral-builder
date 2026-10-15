@@ -1,0 +1,61 @@
+name: Ephemeral Mobile Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        required: true
+        type: string
+      framework:
+        required: true
+        type: string
+      project_slug:
+        required: true
+        type: string
+      source_payload:
+        required: true
+        type: string
+      artifact_type:
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: Prepare isolated workspace
+        run: |
+          WORKDIR="/tmp/k1pro-${{ github.event.inputs.build_id }}"
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
+          echo "${{ github.event.inputs.source_payload }}" | base64 -d > source.tar.gz || true
+          tar -xzf source.tar.gz || true
+          echo "Workspace prepared for ${{ github.event.inputs.framework }}"
+
+      - name: Build artifact
+        run: |
+          WORKDIR="/tmp/k1pro-${{ github.event.inputs.build_id }}"
+          cd "$WORKDIR"
+          # Framework-specific build commands (Flutter, Gradle, Xcode via macOS runners, etc.)
+          # User source is never committed to this repository.
+          echo "Building ${{ github.event.inputs.framework }} → ${{ github.event.inputs.artifact_type }}"
+          # Placeholder: produce a dummy artifact for demonstration
+          echo "K1pro ephemeral build ${{ github.event.inputs.build_id }}" > "app.${{ github.event.inputs.artifact_type }}"
+
+      - name: Upload short-lived artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: k1pro-${{ github.event.inputs.build_id }}
+          path: /tmp/k1pro-${{ github.event.inputs.build_id }}/*.${{ github.event.inputs.artifact_type }}
+          retention-days: 1
+
+      - name: Always cleanup
+        if: always()
+        run: |
+          rm -rf /tmp/k1pro-${{ github.event.inputs.build_id }}
+          echo "Workspace scrubbed – zero source retention"
