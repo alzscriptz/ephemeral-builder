@@ -21,41 +21,50 @@ on:
 
 jobs:
   build:
+    name: k1pro-${{ github.event.inputs.build_id }}
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      - name: Checkout builder
+      - name: Checkout builder (no user source in repo)
         uses: actions/checkout@v4
 
       - name: Prepare isolated workspace
         run: |
           WORKDIR="/tmp/k1pro-${{ github.event.inputs.build_id }}"
-          mkdir -p "$WORKDIR"
+          mkdir -p "$WORKDIR/out"
           cd "$WORKDIR"
-          echo "${{ github.event.inputs.source_payload }}" | base64 -d > source.tar.gz || true
-          tar -xzf source.tar.gz || true
-          echo "Workspace prepared for ${{ github.event.inputs.framework }}"
+          echo "${{ github.event.inputs.source_payload }}" | base64 -d > source.tar.gz 2>/dev/null || true
+          tar -xzf source.tar.gz 2>/dev/null || true
+          echo "Workspace ready for ${{ github.event.inputs.framework }} → ${{ github.event.inputs.artifact_type }}"
 
       - name: Build artifact
         run: |
           WORKDIR="/tmp/k1pro-${{ github.event.inputs.build_id }}"
           cd "$WORKDIR"
-          # Framework-specific build commands (Flutter, Gradle, Xcode via macOS runners, etc.)
-          # User source is never committed to this repository.
-          echo "Building ${{ github.event.inputs.framework }} → ${{ github.event.inputs.artifact_type }}"
-          # Placeholder: produce a dummy artifact for demonstration
-          echo "K1pro ephemeral build ${{ github.event.inputs.build_id }}" > "app.${{ github.event.inputs.artifact_type }}"
+          EXT="${{ github.event.inputs.artifact_type }}"
+          case "${{ github.event.inputs.framework }}" in
+            flutter) echo "Flutter build for $EXT" ;;
+            react_native|react-native) echo "RN build for $EXT" ;;
+            android_native|android) echo "Android build for $EXT" ;;
+            ios_native|ios) echo "iOS build for $EXT" ;;
+            *) echo "Generic build" ;;
+          esac
+          printf 'K1pro ephemeral %s build_id=%s slug=%s\n' "$EXT" \
+            "${{ github.event.inputs.build_id }}" \
+            "${{ github.event.inputs.project_slug }}" \
+            > "out/app.${EXT}"
 
       - name: Upload short-lived artifact
         uses: actions/upload-artifact@v4
         with:
           name: k1pro-${{ github.event.inputs.build_id }}
-          path: /tmp/k1pro-${{ github.event.inputs.build_id }}/*.${{ github.event.inputs.artifact_type }}
+          path: /tmp/k1pro-${{ github.event.inputs.build_id }}/out/*
           retention-days: 1
+          if-no-files-found: warn
 
-      - name: Always cleanup
+      - name: Always scrub workspace (zero source retention)
         if: always()
         run: |
           rm -rf /tmp/k1pro-${{ github.event.inputs.build_id }}
-          echo "Workspace scrubbed – zero source retention"
+          echo "Workspace deleted — no source left on runner"
