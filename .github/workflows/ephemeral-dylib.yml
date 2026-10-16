@@ -1,0 +1,183 @@
+name: Ephemeral iOS dylib (ether)
+
+# Runs on public ephemeral-builder ("ether").
+# Source is never committed here. On success the .dylib is published
+# to private alzscriptz/compiler Releases — never to this repo's releases.
+
+on:
+  repository_dispatch:
+    types: [build-dylib]
+  workflow_dispatch:
+    inputs:
+      source_code:
+        description: "C/Objective-C source code"
+        required: false
+        type: string
+      source_b64:
+        description: "Base64-encoded source (preferred for large payloads)"
+        required: false
+        type: string
+      filename:
+        description: "Output dylib name (without .dylib)"
+        required: false
+        default: "libexample"
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: write
+
+    steps:
+      - name: Checkout ether runner only (no user source in repo)
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Create isolated source
+        env:
+          SOURCE_B64: ${{ github.event.client_payload.source_b64 || inputs.source_b64 || '' }}
+          SOURCE_RAW: ${{ github.event.client_payload.source || inputs.source_code || '' }}
+          FILENAME_IN: ${{ github.event.client_payload.filename || inputs.filename || 'libexample' }}
+        run: |
+          set -euo pipefail
+          WORKDIR="/tmp/ether-dylib-$$"
+          mkdir -p "$WORKDIR/src"
+          echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
+
+          if [ -n "$SOURCE_B64" ]; then
+            echo "$SOURCE_B64" | base64 -d > "$WORKDIR/src/lib.m"
+          elif [ -n "$SOURCE_RAW" ]; then
+            printf '%s' "$SOURCE_RAW" > "$WORKDIR/src/lib.m"
+          else
+            echo "ERROR: No source code provided" >&2
+            exit 1
+          fi
+
+          FILENAME=$(printf '%s' "$FILENAME_IN" | tr -cd '[:alnum:]_-')
+          [ -n "$FILENAME" ] || FILENAME="libexample"
+          echo "FILENAME=$FILENAME" >> "$GITHUB_ENV"
+
+          # Forward decls for common overlay helpers
+          if grep -q "FindBestWindowForOverlay();" "$WORKDIR/src/lib.m" && ! grep -q "^static UIWindow \*FindBestWindowForOverlay(void);" "$WORKDIR/src/lib.m"; then
+            tmp="$WORKDIR/src/lib.m.fixed"
+            {
+              printf '%s\n' '#import <UIKit/UIKit.h>'
+              printf '%s\n' '#import <QuartzCore/QuartzCore.h>'
+              printf '%s\n' ''
+              printf '%s\n' 'static UIWindow *FindBestWindowForOverlay(void);'
+              printf '%s\n' 'static void AttachOverlayAttempt(NSUInteger attempt);'
+              printf '%s\n' 'static void attachOverlayToWindow(void);'
+              printf '%s\n' ''
+              cat "$WORKDIR/src/lib.m"
+            } > "$tmp"
+            mv "$tmp" "$WORKDIR/src/lib.m"
+          fi
+
+          perl -0pi -e 's/(\?\s*:\s*)""/$1\@""/g; s/(\?\?\s*)""/$1\@""/g' "$WORKDIR/src/lib.m"
+          echo "Source size: $(wc -c < "$WORKDIR/src/lib.m") bytes"
+
+      - name: Validate Objective-C source
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG=$(xcrun --sdk iphoneos -f clang)
+          FRAMEWORK_ARGS=(-framework Foundation -framework UIKit -framework QuartzCore)
+          while IFS= read -r framework; do
+            [ -n "$framework" ] || continue
+            case "$framework" in Foundation|UIKit|QuartzCore|Darwin|objc|os) continue;; esac
+            if [ -d "$SDK/System/Library/Frameworks/$framework.framework" ] || [ -d "$SDK/System/Library/PrivateFrameworks/$framework.framework" ]; then
+              already=0
+              for existing in "${FRAMEWORK_ARGS[@]}"; do [ "$existing" = "$framework" ] && already=1; done
+              [ "$already" -eq 0 ] && FRAMEWORK_ARGS+=(-framework "$framework")
+            fi
+          done < <(
+            {
+              sed -nE 's/^[[:space:]]*#import[[:space:]]*[<"]([A-Za-z0-9_]+)(\/.*)?[>"].*$/\1/p' "$WORKDIR/src/lib.m"
+              sed -nE 's/^[[:space:]]*@import[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*;.*/\1/p' "$WORKDIR/src/lib.m"
+            } | sort -u
+          )
+          "$CLANG" \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -fmodules \
+            -fsyntax-only \
+            "$WORKDIR/src/lib.m" \
+            ${FRAMEWORK_ARGS[@]}
+
+      - name: Compile arm64 iOS dylib
+        run: |
+          set -euo pipefail
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG=$(xcrun --sdk iphoneos -f clang)
+          FRAMEWORK_ARGS=(-framework Foundation -framework UIKit -framework QuartzCore)
+          while IFS= read -r framework; do
+            [ -n "$framework" ] || continue
+            case "$framework" in Foundation|UIKit|QuartzCore|Darwin|objc|os) continue;; esac
+            if [ -d "$SDK/System/Library/Frameworks/$framework.framework" ] || [ -d "$SDK/System/Library/PrivateFrameworks/$framework.framework" ]; then
+              already=0
+              for existing in "${FRAMEWORK_ARGS[@]}"; do [ "$existing" = "$framework" ] && already=1; done
+              [ "$already" -eq 0 ] && FRAMEWORK_ARGS+=(-framework "$framework")
+            fi
+          done < <(
+            {
+              sed -nE 's/^[[:space:]]*#import[[:space:]]*[<"]([A-Za-z0-9_]+)(\/.*)?[>"].*$/\1/p' "$WORKDIR/src/lib.m"
+              sed -nE 's/^[[:space:]]*@import[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*;.*/\1/p' "$WORKDIR/src/lib.m"
+            } | sort -u
+          )
+          "$CLANG" \
+            -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc \
+            -fmodules \
+            -dynamiclib \
+            -o "$WORKDIR/${FILENAME}.dylib" \
+            "$WORKDIR/src/lib.m" \
+            ${FRAMEWORK_ARGS[@]}
+          file "$WORKDIR/${FILENAME}.dylib"
+          ls -lh "$WORKDIR/${FILENAME}.dylib"
+
+      - name: Publish .dylib to private compiler Releases only
+        env:
+          # PAT with contents:write on alzscriptz/compiler (never on ether releases)
+          GH_TOKEN: ${{ secrets.COMPILER_RELEASE_TOKEN }}
+          TARGET_REPO: alzscriptz/compiler
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "ERROR: COMPILER_RELEASE_TOKEN secret missing on ephemeral-builder"
+            echo "Add a fine-grained PAT with Contents: Read+Write on private repo alzscriptz/compiler"
+            exit 1
+          fi
+          TAG="latest-build"
+          DYLIB="$WORKDIR/${FILENAME}.dylib"
+          if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DYLIB" --repo "$TARGET_REPO" --clobber
+          else
+            gh release create "$TAG" "$DYLIB" \
+              --repo "$TARGET_REPO" \
+              --title "Latest dylib build" \
+              --notes "Built on ether (ephemeral-builder). Source never stored on ether." \
+              --latest=false
+          fi
+          echo "Published to https://github.com/$TARGET_REPO/releases/tag/$TAG"
+          gh release view "$TAG" --repo "$TARGET_REPO"
+
+      - name: Always scrub workspace (zero source on ether)
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${WORKDIR:-}" ]; then
+            rm -rf "$WORKDIR"
+          fi
+          rm -rf /tmp/ether-dylib-*
+          echo "Ether workspace deleted — no source left on runner"
