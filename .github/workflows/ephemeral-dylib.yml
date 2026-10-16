@@ -1,8 +1,9 @@
 name: Ephemeral iOS dylib (ether)
 
-# Runs on public ephemeral-builder ("ether").
-# Source is never committed here. On success the .dylib is published
-# to private alzscriptz/compiler Releases — never to this repo's releases.
+# Public ether runner. Source is never committed here.
+# Success → .dylib on private alzscriptz/compiler Releases
+# Failure → last-error.txt on private compiler Releases (for site Copy button)
+# always() scrubs workspace; does not publish source to ether
 
 on:
   repository_dispatch:
@@ -14,7 +15,7 @@ on:
         required: false
         type: string
       source_b64:
-        description: "Base64-encoded source (preferred for large payloads)"
+        description: "Base64-encoded source (preferred)"
         required: false
         type: string
       filename:
@@ -32,7 +33,7 @@ jobs:
       actions: write
 
     steps:
-      - name: Checkout ether runner only (no user source in repo)
+      - name: Checkout ether runner only
         uses: actions/checkout@v4
 
       - name: Setup Xcode
@@ -40,7 +41,7 @@ jobs:
         with:
           xcode-version: latest-stable
 
-      - name: Create isolated source
+      - name: Create isolated source (no echo of body)
         env:
           SOURCE_B64: ${{ github.event.client_payload.source_b64 || inputs.source_b64 || '' }}
           SOURCE_RAW: ${{ github.event.client_payload.source || inputs.source_code || '' }}
@@ -52,10 +53,11 @@ jobs:
           echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
 
           if [ -n "$SOURCE_B64" ]; then
-            echo "$SOURCE_B64" | base64 -d > "$WORKDIR/src/lib.m"
+            printf '%s' "$SOURCE_B64" | base64 -d > "$WORKDIR/src/lib.m"
           elif [ -n "$SOURCE_RAW" ]; then
             printf '%s' "$SOURCE_RAW" > "$WORKDIR/src/lib.m"
           else
+            echo "ERROR: No source code provided" > "$WORKDIR/compile-error.txt"
             echo "ERROR: No source code provided" >&2
             exit 1
           fi
@@ -64,7 +66,6 @@ jobs:
           [ -n "$FILENAME" ] || FILENAME="libexample"
           echo "FILENAME=$FILENAME" >> "$GITHUB_ENV"
 
-          # Forward decls for common overlay helpers
           if grep -q "FindBestWindowForOverlay();" "$WORKDIR/src/lib.m" && ! grep -q "^static UIWindow \*FindBestWindowForOverlay(void);" "$WORKDIR/src/lib.m"; then
             tmp="$WORKDIR/src/lib.m.fixed"
             {
@@ -81,9 +82,11 @@ jobs:
           fi
 
           perl -0pi -e 's/(\?\s*:\s*)""/$1\@""/g; s/(\?\?\s*)""/$1\@""/g' "$WORKDIR/src/lib.m"
-          echo "Source size: $(wc -c < "$WORKDIR/src/lib.m") bytes"
+          # Never print source — only size
+          echo "Source bytes: $(wc -c < "$WORKDIR/src/lib.m" | tr -d ' ')"
 
-      - name: Validate Objective-C source
+      - name: Validate + compile arm64 iOS dylib
+        id: compile
         run: |
           set -euo pipefail
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -103,6 +106,11 @@ jobs:
               sed -nE 's/^[[:space:]]*@import[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*;.*/\1/p' "$WORKDIR/src/lib.m"
             } | sort -u
           )
+
+          ERR="$WORKDIR/compile-error.txt"
+          : > "$ERR"
+
+          set +e
           "$CLANG" \
             -arch arm64 \
             -isysroot "$SDK" \
@@ -111,28 +119,21 @@ jobs:
             -fmodules \
             -fsyntax-only \
             "$WORKDIR/src/lib.m" \
-            ${FRAMEWORK_ARGS[@]}
-
-      - name: Compile arm64 iOS dylib
-        run: |
-          set -euo pipefail
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          CLANG=$(xcrun --sdk iphoneos -f clang)
-          FRAMEWORK_ARGS=(-framework Foundation -framework UIKit -framework QuartzCore)
-          while IFS= read -r framework; do
-            [ -n "$framework" ] || continue
-            case "$framework" in Foundation|UIKit|QuartzCore|Darwin|objc|os) continue;; esac
-            if [ -d "$SDK/System/Library/Frameworks/$framework.framework" ] || [ -d "$SDK/System/Library/PrivateFrameworks/$framework.framework" ]; then
-              already=0
-              for existing in "${FRAMEWORK_ARGS[@]}"; do [ "$existing" = "$framework" ] && already=1; done
-              [ "$already" -eq 0 ] && FRAMEWORK_ARGS+=(-framework "$framework")
-            fi
-          done < <(
+            ${FRAMEWORK_ARGS[@]} \
+            >"$WORKDIR/syntax.out" 2>"$WORKDIR/syntax.err"
+          SYN=$?
+          set -e
+          if [ "$SYN" -ne 0 ]; then
             {
-              sed -nE 's/^[[:space:]]*#import[[:space:]]*[<"]([A-Za-z0-9_]+)(\/.*)?[>"].*$/\1/p' "$WORKDIR/src/lib.m"
-              sed -nE 's/^[[:space:]]*@import[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*;.*/\1/p' "$WORKDIR/src/lib.m"
-            } | sort -u
-          )
+              echo "=== syntax / type check failed ==="
+              # Strip absolute paths that include workdir; keep compiler messages
+              sed "s|$WORKDIR/||g" "$WORKDIR/syntax.err" | tail -n 80
+            } > "$ERR"
+            cat "$ERR" >&2
+            exit 1
+          fi
+
+          set +e
           "$CLANG" \
             -arch arm64 \
             -isysroot "$SDK" \
@@ -142,40 +143,81 @@ jobs:
             -dynamiclib \
             -o "$WORKDIR/${FILENAME}.dylib" \
             "$WORKDIR/src/lib.m" \
-            ${FRAMEWORK_ARGS[@]}
+            ${FRAMEWORK_ARGS[@]} \
+            >"$WORKDIR/link.out" 2>"$WORKDIR/link.err"
+          LINK=$?
+          set -e
+          if [ "$LINK" -ne 0 ]; then
+            {
+              echo "=== link / compile failed ==="
+              sed "s|$WORKDIR/||g" "$WORKDIR/link.err" | tail -n 80
+            } > "$ERR"
+            cat "$ERR" >&2
+            exit 1
+          fi
+
           file "$WORKDIR/${FILENAME}.dylib"
           ls -lh "$WORKDIR/${FILENAME}.dylib"
 
       - name: Publish .dylib to private compiler Releases only
+        if: success()
         env:
-          # PAT with contents:write on alzscriptz/compiler (never on ether releases)
           GH_TOKEN: ${{ secrets.COMPILER_RELEASE_TOKEN }}
           TARGET_REPO: alzscriptz/compiler
         run: |
           set -euo pipefail
           if [ -z "${GH_TOKEN:-}" ]; then
-            echo "ERROR: COMPILER_RELEASE_TOKEN secret missing on ephemeral-builder"
-            echo "Add a fine-grained PAT with Contents: Read+Write on private repo alzscriptz/compiler"
+            echo "ERROR: COMPILER_RELEASE_TOKEN missing" >&2
             exit 1
           fi
           TAG="latest-build"
           DYLIB="$WORKDIR/${FILENAME}.dylib"
+          # Clear previous error marker on success
           if gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release delete-asset "$TAG" last-error.txt --repo "$TARGET_REPO" --yes 2>/dev/null || true
             gh release upload "$TAG" "$DYLIB" --repo "$TARGET_REPO" --clobber
           else
             gh release create "$TAG" "$DYLIB" \
               --repo "$TARGET_REPO" \
               --title "Latest dylib build" \
-              --notes "Built on ether (ephemeral-builder). Source never stored on ether." \
+              --notes "Built on ether. Source never stored on ether." \
               --latest=false
           fi
-          echo "Published to https://github.com/$TARGET_REPO/releases/tag/$TAG"
-          gh release view "$TAG" --repo "$TARGET_REPO"
+          echo "Published dylib to $TARGET_REPO @$TAG"
+
+      - name: Publish compile error to private compiler (for site Copy)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.COMPILER_RELEASE_TOKEN }}
+          TARGET_REPO: alzscriptz/compiler
+        run: |
+          set -euo pipefail
+          ERR="$WORKDIR/compile-error.txt"
+          if [ ! -s "$ERR" ]; then
+            echo "Build failed (no captured compiler message). Check Actions briefly before run is cleaned." > "$ERR"
+          fi
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "COMPILER_RELEASE_TOKEN missing — cannot mirror error to compiler" >&2
+            exit 0
+          fi
+          TAG="latest-build"
+          # Ensure release exists so we can attach last-error.txt only (no dylib)
+          if ! gh release view "$TAG" --repo "$TARGET_REPO" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$TARGET_REPO" \
+              --title "Latest dylib build" \
+              --notes "Error-only placeholder" \
+              --latest=false
+          fi
+          # Upload as last-error.txt for the website to fetch
+          cp "$ERR" last-error.txt
+          gh release upload "$TAG" last-error.txt --repo "$TARGET_REPO" --clobber
+          echo "Error text mirrored to private compiler release (last-error.txt)"
 
       - name: Always scrub workspace (zero source on ether)
         if: always()
         run: |
-          set -euo pipefail
+          set +e
           if [ -n "${WORKDIR:-}" ]; then
             rm -rf "$WORKDIR"
           fi
