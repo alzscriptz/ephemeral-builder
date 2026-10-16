@@ -1,30 +1,23 @@
-# K1pro☆ Ephemeral Builder
+# ephemeral-builder (ether)
 
-**Public** GitHub Actions backend for [K1pro☆](https://github.com/alzscriptz/k1pro).
+Public GitHub Actions runner for **alzscriptz/compiler**.
 
-## What this does
+- Receives Objective-C/C source via `repository_dispatch` (`build-dylib`) — **never committed here**
+- Builds arm64 iOS `.dylib` on `macos-15` + Xcode
+- Publishes the `.dylib` to **private** [alzscriptz/compiler](https://github.com/alzscriptz/compiler) Releases (`latest-build`)
+- **Does not** create releases on this repo
+- `always()` deletes the workspace so source does not remain on the runner
 
-1. Receives a `workflow_dispatch` with a minimal build payload (no permanent source commit).
-2. Builds the mobile artifact (APK / AAB / IPA) in an isolated `/tmp` workspace.
-3. Uploads a short-lived artifact (1-day retention).
-4. Runs an **`always()`** cleanup step that deletes the workspace — **zero source retention**.
+## Secret required
 
-## Trigger
+| Name | Value |
+|------|--------|
+| `COMPILER_RELEASE_TOKEN` | Fine-grained PAT: Contents Read+Write on **only** `alzscriptz/compiler` |
 
-Dispatched by the K1pro platform via the GitHub REST API:
+Add under **Settings → Secrets and variables → Actions**.
 
-```bash
-gh api repos/alzscriptz/ephemeral-builder/actions/workflows/ephemeral-build.yml/dispatches \
-  -f ref=main \
-  -f inputs='{"build_id":"...","framework":"flutter","project_slug":"my-app","source_payload":"...","artifact_type":"apk"}'
-```
+## Workflow
 
-## Security model
+`.github/workflows/ephemeral-dylib.yml`
 
-- This repository never stores user source code.
-- Source is delivered ephemerally for the job only.
-- Cleanup runs on success **and** failure (`if: always()`).
-
-## License
-
-MIT
+Trigger: `repository_dispatch` type `build-dylib` with `client_payload.source_b64` and `client_payload.filename`.
