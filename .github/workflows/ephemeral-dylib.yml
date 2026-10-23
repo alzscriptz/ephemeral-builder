@@ -1,9 +1,14 @@
-name: Ephemeral iOS dylib (ether)
+name: Ephemeral multi-SDK dylib (ether)
 
 # Public ether runner. Source is never committed here.
 # Success → .dylib on private alzscriptz/compiler Releases
 # Failure → last-error.txt on private compiler Releases (for site Copy button)
 # always() scrubs workspace; does not publish source to ether
+#
+# Supported SDKs (client_payload.sdk or inputs.sdk):
+#   iphoneos (default) | iphonesimulator | macosx
+#   appletvos | appletvsimulator | watchos | watchsimulator
+#   xros | xrsimulator
 
 on:
   repository_dispatch:
@@ -23,6 +28,21 @@ on:
         required: false
         default: "libexample"
         type: string
+      sdk:
+        description: "Apple SDK to target"
+        required: false
+        default: "iphoneos"
+        type: choice
+        options:
+          - iphoneos
+          - iphonesimulator
+          - macosx
+          - appletvos
+          - appletvsimulator
+          - watchos
+          - watchsimulator
+          - xros
+          - xrsimulator
 
 jobs:
   build:
@@ -46,6 +66,7 @@ jobs:
           SOURCE_B64: ${{ github.event.client_payload.source_b64 || inputs.source_b64 || '' }}
           SOURCE_RAW: ${{ github.event.client_payload.source || inputs.source_code || '' }}
           FILENAME_IN: ${{ github.event.client_payload.filename || inputs.filename || 'libexample' }}
+          SDK_IN: ${{ github.event.client_payload.sdk || inputs.sdk || 'iphoneos' }}
         run: |
           set -euo pipefail
           WORKDIR="/tmp/ether-dylib-$$"
@@ -66,6 +87,27 @@ jobs:
           [ -n "$FILENAME" ] || FILENAME="libexample"
           echo "FILENAME=$FILENAME" >> "$GITHUB_ENV"
 
+          # Normalize / validate requested SDK
+          SDK_NAME=$(printf '%s' "$SDK_IN" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]')
+          case "$SDK_NAME" in
+            iphoneos|iphonesimulator|macosx|appletvos|appletvsimulator|watchos|watchsimulator|xros|xrsimulator) ;;
+            mac|macos|osx|darwin) SDK_NAME="macosx" ;;
+            ios|iphone) SDK_NAME="iphoneos" ;;
+            iossim|sim) SDK_NAME="iphonesimulator" ;;
+            tvos|appletv) SDK_NAME="appletvos" ;;
+            tvossim) SDK_NAME="appletvsimulator" ;;
+            watch) SDK_NAME="watchos" ;;
+            watchsim) SDK_NAME="watchsimulator" ;;
+            visionos|xr) SDK_NAME="xros" ;;
+            visionossim|xrsim) SDK_NAME="xrsimulator" ;;
+            *)
+              echo "ERROR: Unsupported SDK '$SDK_IN'. Allowed: iphoneos iphonesimulator macosx appletvos appletvsimulator watchos watchsimulator xros xrsimulator" > "$WORKDIR/compile-error.txt"
+              cat "$WORKDIR/compile-error.txt" >&2
+              exit 1
+              ;;
+          esac
+          echo "SDK_NAME=$SDK_NAME" >> "$GITHUB_ENV"
+
           if grep -q "FindBestWindowForOverlay();" "$WORKDIR/src/lib.m" && ! grep -q "^static UIWindow \*FindBestWindowForOverlay(void);" "$WORKDIR/src/lib.m"; then
             tmp="$WORKDIR/src/lib.m.fixed"
             {
@@ -84,17 +126,76 @@ jobs:
           perl -0pi -e 's/(\?\s*:\s*)""/$1\@""/g; s/(\?\?\s*)""/$1\@""/g' "$WORKDIR/src/lib.m"
           # Never print source — only size
           echo "Source bytes: $(wc -c < "$WORKDIR/src/lib.m" | tr -d ' ')"
+          echo "Target SDK: $SDK_NAME"
 
-      - name: Validate + compile arm64 iOS dylib
+      - name: Validate + compile dylib for selected Apple SDK
         id: compile
         run: |
           set -euo pipefail
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          CLANG=$(xcrun --sdk iphoneos -f clang)
-          FRAMEWORK_ARGS=(-framework Foundation -framework UIKit -framework QuartzCore)
+
+          # Resolve SDK path + clang; fail clearly if the platform is missing on the runner
+          if ! SDK=$(xcrun --sdk "$SDK_NAME" --show-sdk-path 2>/dev/null); then
+            echo "ERROR: SDK '$SDK_NAME' is not available on this Xcode. Install the corresponding platform in Xcode → Settings → Platforms." > "$WORKDIR/compile-error.txt"
+            cat "$WORKDIR/compile-error.txt" >&2
+            exit 1
+          fi
+          CLANG=$(xcrun --sdk "$SDK_NAME" -f clang)
+
+          # Per-SDK defaults (arch + deployment flag)
+          ARCH="arm64"
+          MINFLAG=""
+          case "$SDK_NAME" in
+            iphoneos)
+              ARCH="arm64"
+              MINFLAG="-miphoneos-version-min=14.0"
+              ;;
+            iphonesimulator)
+              ARCH="arm64"
+              MINFLAG="-miphonesimulator-version-min=14.0"
+              ;;
+            macosx)
+              ARCH="arm64"
+              MINFLAG="-mmacosx-version-min=11.0"
+              ;;
+            appletvos)
+              ARCH="arm64"
+              MINFLAG="-mappletvos-version-min=14.0"
+              ;;
+            appletvsimulator)
+              ARCH="arm64"
+              MINFLAG="-mappletvsimulator-version-min=14.0"
+              ;;
+            watchos)
+              ARCH="arm64"
+              MINFLAG="-mwatchos-version-min=7.0"
+              ;;
+            watchsimulator)
+              ARCH="arm64"
+              MINFLAG="-mwatchsimulator-version-min=7.0"
+              ;;
+            xros)
+              ARCH="arm64"
+              MINFLAG="-mxros-version-min=1.0"
+              ;;
+            xrsimulator)
+              ARCH="arm64"
+              MINFLAG="-mxrsimulator-version-min=1.0"
+              ;;
+          esac
+
+          # Base frameworks differ slightly by platform family
+          case "$SDK_NAME" in
+            macosx)
+              FRAMEWORK_ARGS=(-framework Foundation -framework AppKit -framework QuartzCore)
+              ;;
+            *)
+              FRAMEWORK_ARGS=(-framework Foundation -framework UIKit -framework QuartzCore)
+              ;;
+          esac
+
           while IFS= read -r framework; do
             [ -n "$framework" ] || continue
-            case "$framework" in Foundation|UIKit|QuartzCore|Darwin|objc|os) continue;; esac
+            case "$framework" in Foundation|UIKit|AppKit|QuartzCore|Darwin|objc|os) continue;; esac
             if [ -d "$SDK/System/Library/Frameworks/$framework.framework" ] || [ -d "$SDK/System/Library/PrivateFrameworks/$framework.framework" ]; then
               already=0
               for existing in "${FRAMEWORK_ARGS[@]}"; do [ "$existing" = "$framework" ] && already=1; done
@@ -102,7 +203,7 @@ jobs:
             fi
           done < <(
             {
-              sed -nE 's/^[[:space:]]*#import[[:space:]]*[<"]([A-Za-z0-9_]+)(\/.*)?[>"].*$/\1/p' "$WORKDIR/src/lib.m"
+              sed -nE 's/^[[:space:]]*#import[[:space:]]*[<"]([A-Za-z0-9_]+)(\/.*)?[>"][[:space:]]*$/\1/p' "$WORKDIR/src/lib.m"
               sed -nE 's/^[[:space:]]*@import[[:space:]]+([A-Za-z0-9_]+)[[:space:]]*;.*/\1/p' "$WORKDIR/src/lib.m"
             } | sort -u
           )
@@ -110,11 +211,17 @@ jobs:
           ERR="$WORKDIR/compile-error.txt"
           : > "$ERR"
 
+          echo "Using SDK: $SDK"
+          echo "Using clang: $CLANG"
+          echo "Arch: $ARCH  Min-flag: $MINFLAG"
+          echo "Frameworks:"
+          printf '  %s\n' "${FRAMEWORK_ARGS[@]}"
+
           set +e
           "$CLANG" \
-            -arch arm64 \
+            -arch "$ARCH" \
             -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
+            $MINFLAG \
             -fobjc-arc \
             -fmodules \
             -fsyntax-only \
@@ -125,8 +232,7 @@ jobs:
           set -e
           if [ "$SYN" -ne 0 ]; then
             {
-              echo "=== syntax / type check failed ==="
-              # Strip absolute paths that include workdir; keep compiler messages
+              echo "=== syntax / type check failed (SDK=$SDK_NAME) ==="
               sed "s|$WORKDIR/||g" "$WORKDIR/syntax.err" | tail -n 80
             } > "$ERR"
             cat "$ERR" >&2
@@ -135,9 +241,9 @@ jobs:
 
           set +e
           "$CLANG" \
-            -arch arm64 \
+            -arch "$ARCH" \
             -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
+            $MINFLAG \
             -fobjc-arc \
             -fmodules \
             -dynamiclib \
@@ -149,7 +255,7 @@ jobs:
           set -e
           if [ "$LINK" -ne 0 ]; then
             {
-              echo "=== link / compile failed ==="
+              echo "=== link / compile failed (SDK=$SDK_NAME) ==="
               sed "s|$WORKDIR/||g" "$WORKDIR/link.err" | tail -n 80
             } > "$ERR"
             cat "$ERR" >&2
@@ -180,10 +286,10 @@ jobs:
             gh release create "$TAG" "$DYLIB" \
               --repo "$TARGET_REPO" \
               --title "Latest dylib build" \
-              --notes "Built on ether. Source never stored on ether." \
+              --notes "Built on ether (SDK=$SDK_NAME). Source never stored on ether." \
               --latest=false
           fi
-          echo "Published dylib to $TARGET_REPO @$TAG"
+          echo "Published dylib to $TARGET_REPO @$TAG (SDK=$SDK_NAME)"
 
       - name: Publish compile error to private compiler (for site Copy)
         if: failure()
